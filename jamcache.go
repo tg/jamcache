@@ -25,8 +25,9 @@ type Cache struct {
 	// rungc is a flag used in Get() to run rotate
 	rungc int64
 
-	keyLockLock sync.Mutex
-	keyLock     map[interface{}]chan struct{}
+	// keySetChan holds channels for syncing GetOrSet method
+	keySetChan     map[interface{}]chan struct{}
+	keySetChanLock sync.Mutex
 }
 
 type items map[interface{}]interface{}
@@ -41,9 +42,9 @@ func New(n int, dur time.Duration) *Cache {
 	}
 
 	return &Cache{
-		gens:    make([]items, n),
-		genDur:  dur,
-		keyLock: make(map[interface{}]chan struct{}),
+		gens:       make([]items, n),
+		genDur:     dur,
+		keySetChan: make(map[interface{}]chan struct{}),
 	}
 }
 
@@ -144,23 +145,23 @@ func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() 
 		// fetch will be set to true if we're responsible for fetching the value
 		var fetch bool
 
-		// grab the key lock (so there is only one fetcher)
-		c.keyLockLock.Lock()
-		done := c.keyLock[key]
+		// grab the key channel (so there is only one fetcher)
+		c.keySetChanLock.Lock()
+		done := c.keySetChan[key]
 		if done == nil {
 			done = make(chan struct{})
-			c.keyLock[key] = done
+			c.keySetChan[key] = done
 			fetch = true
 		}
-		c.keyLockLock.Unlock()
+		c.keySetChanLock.Unlock()
 
 		if fetch {
 			// once we fetch let others know and remove the done channel
 			defer func() {
 				close(done)
-				c.keyLockLock.Lock()
-				delete(c.keyLock, key)
-				c.keyLockLock.Unlock()
+				c.keySetChanLock.Lock()
+				delete(c.keySetChan, key)
+				c.keySetChanLock.Unlock()
 			}()
 
 			// check again in cache in case it was added in the meantime
