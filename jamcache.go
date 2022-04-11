@@ -5,6 +5,7 @@
 package jamcache
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,10 @@ type Cache struct {
 
 	// rungc is a flag used in Get() to run rotate
 	rungc int64
+
+	// keySetChan holds channels for syncing GetOrSet method
+	keySetChan     map[interface{}]chan struct{}
+	keySetChanLock sync.Mutex
 }
 
 type items map[interface{}]interface{}
@@ -37,8 +42,9 @@ func New(n int, dur time.Duration) *Cache {
 	}
 
 	return &Cache{
-		gens:   make([]items, n),
-		genDur: dur,
+		gens:       make([]items, n),
+		genDur:     dur,
+		keySetChan: make(map[interface{}]chan struct{}),
 	}
 }
 
@@ -95,6 +101,8 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 
 	// Mark for rotation if not all generations are valid and cache has been
 	// initialized. We use CompareAndSwap to make sure only one Get() runs rotation.
+	// TODO: as we need to grab a lock later for this operation and we do it in Set
+	// anyway (which is prefarable), we could add some slack here in case Set is called regularly.
 	if ng != len(c.gens) {
 		if !c.head.IsZero() {
 			rungc = atomic.CompareAndSwapInt64(&c.rungc, 0, 1)
@@ -121,6 +129,71 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 	}
 
 	return val, found
+}
+
+// GetOrSet gets the values from the cache and if it's not present then loads it by calling loadValue.
+// When there are multiple simultaneous calls for the same key, only one will load the value and other
+// will wait for it to finish. Waiting can be aborted by cancelling the context.
+// Retruns the value and error passed from the call to loadValue.
+func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
+	for {
+		// check in the cache first
+		if v, ok := c.Get(key); ok {
+			return v, nil
+		}
+
+		// fetch will be set to true if we're responsible for fetching the value
+		var fetch bool
+
+		// grab the key channel (so there is only one fetcher)
+		c.keySetChanLock.Lock()
+		done := c.keySetChan[key]
+		if done == nil {
+			done = make(chan struct{})
+			c.keySetChan[key] = done
+			fetch = true
+		}
+		c.keySetChanLock.Unlock()
+
+		if fetch {
+			// once we fetch let others know and remove the done channel
+			defer func() {
+				close(done)
+				c.keySetChanLock.Lock()
+				delete(c.keySetChan, key)
+				c.keySetChanLock.Unlock()
+			}()
+
+			// check again in cache in case it was added in the meantime
+			// (it's possible when done channel is removed just after the first Get)
+			if v, ok := c.Get(key); ok {
+				return v, nil
+			}
+
+			// fetch the value
+			v, err := loadValue()
+			if err != nil {
+				return v, err
+			}
+
+			// set value in the cache
+			c.Set(key, v)
+			return v, nil
+		} else {
+			// use default context if missing
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			// Wait for the fetcher to finish. We will grab the value from the
+			// cache in the next iteration.
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
 }
 
 // vgens returns valid (non-expired) generations for the timestamp
