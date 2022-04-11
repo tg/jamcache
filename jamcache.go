@@ -130,7 +130,11 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 	return val, found
 }
 
-func (c *Cache) GetOrSet(ctx context.Context, key interface{}, valFn func() (interface{}, error)) (interface{}, error) {
+// GetOrSet gets the values from the cache and if it's not present then loads it by calling loadValue.
+// When there are multiple simultaneous calls for the same key, only one will load the value and other
+// will wait for it to finish. Waiting can be aborted by cancelling the context.
+// Retruns the value and error passed from the call to loadValue.
+func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
 	for {
 		// check in the cache first
 		if v, ok := c.Get(key); ok {
@@ -166,7 +170,7 @@ func (c *Cache) GetOrSet(ctx context.Context, key interface{}, valFn func() (int
 			}
 
 			// fetch the value
-			v, err := valFn()
+			v, err := loadValue()
 			if err != nil {
 				return v, err
 			}
