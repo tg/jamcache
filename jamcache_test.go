@@ -1,6 +1,10 @@
 package jamcache
 
 import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -108,5 +112,135 @@ func TestCache_expireAll(t *testing.T) {
 
 	if v, _ := c.Get(1); v != 20 {
 		t.Fatal(v)
+	}
+}
+
+func TestCache_GetOrSet_oneByOne(t *testing.T) {
+	c := New(1, time.Hour)
+
+	for k := 0; k < 10; k++ {
+		v, err := c.GetOrSet(nil, 1, func() (interface{}, error) { return 10 + k, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		// we should only get the very first value
+		if v != 10 {
+			t.Errorf("[%d] unexpected value: %v", k, v)
+		}
+	}
+}
+
+func TestCache_GetOrSet_oneByOneMultipleRoutines(t *testing.T) {
+	c := New(1, time.Hour)
+
+	for r := 0; r < 10; r++ {
+		r := r
+		t.Run(fmt.Sprintf("r=%d", r), func(t *testing.T) {
+			t.Parallel()
+
+			for k := 0; k < 1000; k++ {
+				v, err := c.GetOrSet(nil, r, func() (interface{}, error) { return 1000 + r + k, nil })
+				if err != nil {
+					t.Fatal(err)
+				}
+				// we should only get the very first value
+				if v != 1000+r {
+					t.Errorf("[%d] unexpected value: %v", k, v)
+				}
+			}
+		})
+	}
+}
+
+// func TestCache_GetOrSet_fewKeysManyWriters(t *testing.T) {
+// 	c := New(1, time.Hour)
+
+// 	for r := 0; r < 10; r++ {
+// 		r := r
+// 		t.Run(fmt.Sprintf("r=%d", r), func(t *testing.T) {
+// 			t.Parallel()
+
+// 			for k := 0; k < 1000; k++ {
+// 				v, err := c.GetOrSet(nil, k%10, func() (interface{}, error) { return 1000 + r + k, nil })
+// 				if err != nil {
+// 					t.Fatal(err)
+// 				}
+// 				// we should only get the very first value
+// 				if v != 1000+r {
+// 					t.Errorf("[%d] unexpected value: %v", k, v)
+// 				}
+// 			}
+// 		})
+// 	}
+// }
+
+func TestCache_GetOrSet_random(t *testing.T) {
+	c := New(1, time.Hour)
+
+	size := 100
+	access := make([]int64, size)
+
+	var wg sync.WaitGroup
+	for r := 0; r < size*100; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := rand.Intn(size)
+			_, err := c.GetOrSet(nil, key, func() (interface{}, error) {
+				atomic.AddInt64(&access[key], 1)
+				return -key, nil
+			})
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// make sure we called every func once
+	for n := range access {
+		if access[n] != 1 {
+			t.Errorf("unpexted number of access at %d: %d", n, access[n])
+		}
+	}
+
+	if s := c.Len(); s != size {
+		t.Errorf("unexpected cache size: %d", s)
+	}
+
+	// check the values
+	for key := 0; key < size; key++ {
+		v, ok := c.Get(key)
+		if ok == false || v.(int) != -key {
+			t.Errorf("%d: expected %d, got %v [%v]", key, -key, v, ok)
+		}
+	}
+}
+
+func BenchmarkCache_GetOrSet(b *testing.B) {
+	c := New(3, time.Hour)
+
+	var key int64
+
+	for n := 0; n < b.N; n++ {
+		var wg sync.WaitGroup
+		for r := 0; r < 10; r++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for k := 0; k < 100; k++ {
+					// generate ubnique key for all operations
+					atomic.AddInt64(&key, 1)
+					_, err := c.GetOrSet(nil, key, func() (interface{}, error) {
+						return nil, nil
+					})
+					if err != nil {
+						panic(err)
+					}
+				}
+			}()
+		}
+		wg.Wait()
 	}
 }

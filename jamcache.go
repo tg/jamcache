@@ -5,6 +5,7 @@
 package jamcache
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,9 @@ type Cache struct {
 
 	// rungc is a flag used in Get() to run rotate
 	rungc int64
+
+	keyLockLock sync.Mutex
+	keyLock     map[interface{}]chan struct{}
 }
 
 type items map[interface{}]interface{}
@@ -37,8 +41,9 @@ func New(n int, dur time.Duration) *Cache {
 	}
 
 	return &Cache{
-		gens:   make([]items, n),
-		genDur: dur,
+		gens:    make([]items, n),
+		genDur:  dur,
+		keyLock: make(map[interface{}]chan struct{}),
 	}
 }
 
@@ -95,6 +100,8 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 
 	// Mark for rotation if not all generations are valid and cache has been
 	// initialized. We use CompareAndSwap to make sure only one Get() runs rotation.
+	// TODO: as we need to grab a lock later for this operation and we do it in Set
+	// anyway (which is prefarable), we could add some slack here in case Set is called regularly.
 	if ng != len(c.gens) {
 		if !c.head.IsZero() {
 			rungc = atomic.CompareAndSwapInt64(&c.rungc, 0, 1)
@@ -121,6 +128,67 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 	}
 
 	return val, found
+}
+
+func (c *Cache) GetOrSet(ctx context.Context, key interface{}, valFn func() (interface{}, error)) (interface{}, error) {
+	for {
+		// check in the cache first
+		if v, ok := c.Get(key); ok {
+			return v, nil
+		}
+
+		// fetch will be set to true if we're responsible for fetching the value
+		var fetch bool
+
+		// grab the key lock (so there is only one fetcher)
+		c.keyLockLock.Lock()
+		done := c.keyLock[key]
+		if done == nil {
+			done = make(chan struct{})
+			c.keyLock[key] = done
+			fetch = true
+		}
+		c.keyLockLock.Unlock()
+
+		if fetch {
+			// once we fetch let others know and remove the done channel
+			defer func() {
+				close(done)
+				c.keyLockLock.Lock()
+				delete(c.keyLock, key)
+				c.keyLockLock.Unlock()
+			}()
+
+			// check again in cache in case it was added in the meantime
+			// (it's possible when done channel is removed just after the first Get)
+			if v, ok := c.Get(key); ok {
+				return v, nil
+			}
+
+			// fetch the value
+			v, err := valFn()
+			if err != nil {
+				return v, err
+			}
+
+			// set value in the cache
+			c.Set(key, v)
+			return v, nil
+		} else {
+			// use default context if missing
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			// Wait for the fetcher to finish. We will grab the value from the
+			// cache in the next iteration.
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
 }
 
 // vgens returns valid (non-expired) generations for the timestamp
