@@ -1,6 +1,8 @@
 package jamcache
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -305,6 +307,122 @@ func TestCache_GetOrSet_random(t *testing.T) {
 			t.Errorf("%d: expected %d, got %v [%v]", key, -key, v, ok)
 		}
 	}
+}
+
+func TestCache_GetOrSet_error(t *testing.T) {
+	c := New(1, time.Hour)
+	someError := errors.New("some error")
+
+	for n := 0; n < 100; n++ {
+		n := n
+
+		// Set value for n=10, otherwise error. The function shouln't be called
+		// after the value was returned (as it will be in cache).
+		v, err := c.GetOrSet(nil, 1, func() (interface{}, error) {
+			if n != 10 {
+				return nil, someError
+			}
+			if n > 10 {
+				t.Errorf("unexpected call for n=%d", n)
+			}
+			return n, nil
+		})
+
+		// check we get error for the first 10 calls, then the value
+		if n < 10 {
+			if err != someError {
+				t.Errorf("[%d] expected error, got: %v [with value: %v]", n, err, v)
+			}
+		} else {
+			if got := v.(int); got != 10 || err != nil {
+				t.Errorf("expected value 10, got %d [err=%v]", got, err)
+			}
+		}
+	}
+}
+
+func TestCache_GetOrSet_errorWithWaiter(t *testing.T) {
+	c := New(1, time.Hour)
+	someError := errors.New("some error")
+
+	res := make(chan interface{})
+
+	v, err := c.GetOrSet(nil, 1, func() (interface{}, error) {
+		// run another setter in the background
+		go func() {
+			v, err := c.GetOrSet(nil, 1, func() (interface{}, error) {
+				return 20, nil
+			})
+			if err != nil {
+				t.Error(err)
+			}
+			res <- v
+		}()
+
+		time.Sleep(time.Millisecond)
+
+		// return error from the first call
+		return 10, someError
+	})
+
+	// outer call returns error
+	if err != someError {
+		t.Error(err)
+	}
+	if v.(int) != 10 {
+		t.Error(v)
+	}
+
+	// make sure we get the valid value from the waiter (inner call)
+	if v := <-res; v.(int) != 20 {
+		t.Errorf("unexpected value: %v", v)
+	}
+}
+
+func TestCache_GetOrSet_cancelWaiter(t *testing.T) {
+	c := New(1, time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	waiterError := make(chan error)
+	sleep := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		v, err := c.GetOrSet(ctx, 1, func() (interface{}, error) {
+			go func() {
+				v, err := c.GetOrSet(ctx, 1, func() (interface{}, error) {
+					t.Error("this shouldn't be called")
+					return nil, nil
+				})
+				if v != nil {
+					t.Error(v)
+				}
+				waiterError <- err
+			}()
+
+			<-sleep
+			return 10, nil
+		})
+
+		if v != 10 || err != nil {
+			t.Error(v, err)
+		}
+	}()
+
+	// cancel context (should affect waiter only)
+	cancel()
+
+	if err := <-waiterError; err != context.Canceled {
+		t.Error(err)
+	}
+
+	// wake up outer call and wait for it to finish
+	sleep <- struct{}{}
+	wg.Wait()
 }
 
 func BenchmarkCache_GetOrSet_uniqueKeys(b *testing.B) {
