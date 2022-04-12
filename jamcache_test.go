@@ -76,6 +76,114 @@ func TestCache_rotate10(t *testing.T) {
 	}
 }
 
+func countNonEmptyGens(c *Cache) int {
+	res := 0
+
+	for _, g := range c.gens {
+		if len(g) > 0 {
+			res++
+		}
+	}
+
+	return res
+}
+
+func TestCache_numOfGens(t *testing.T) {
+	c := New(3, 100*time.Millisecond)
+
+	checkGens := func(n int) error {
+		if got := countNonEmptyGens(c); got != n {
+			return fmt.Errorf("found %d generations, expected %d >> %v", got, n, c.gens)
+		}
+		return nil
+	}
+
+	if err := checkGens(0); err != nil {
+		t.Error(err)
+	}
+
+	c.Set(1, nil)
+
+	if err := checkGens(1); err != nil {
+		t.Error(err)
+	}
+
+	sleepUntilRotates(c)
+	c.Set(2, nil)
+
+	if err := checkGens(2); err != nil {
+		t.Error(err)
+	}
+
+	c.Set(3, nil)
+
+	if err := checkGens(2); err != nil {
+		t.Error(err)
+	}
+
+	sleepUntilRotates(c)
+	c.Set(4, nil)
+
+	if err := checkGens(3); err != nil {
+		t.Error(err)
+	}
+
+	sleepUntilRotates(c)
+	c.Set(5, nil)
+
+	if err := checkGens(3); err != nil {
+		t.Error(err)
+	}
+
+	sleepUntilRotates(c)
+	// this time run Get, we should also run GC
+	_, _ = c.Get(0)
+
+	if err := checkGens(2); err != nil {
+		t.Error(err)
+	}
+
+	_, _ = c.Get(0)
+
+	if err := checkGens(2); err != nil {
+		t.Error(err)
+	}
+
+	sleepUntilRotates(c)
+
+	_, _ = c.Get(0)
+	if err := checkGens(1); err != nil {
+		t.Error(err)
+	}
+
+	sleepUntilRotates(c)
+	_, _ = c.Get(0)
+
+	if err := checkGens(0); err != nil {
+		t.Error(err)
+	}
+
+	// Add again
+
+	for n := 0; n < 5; n++ {
+		sleepUntilRotates(c)
+		c.Set(1, nil)
+	}
+
+	if err := checkGens(3); err != nil {
+		t.Error(err)
+	}
+
+	// sleep until should be empty
+	time.Sleep(c.genDur * 3)
+
+	// make sure we clear the cache on an operation
+	c.Get(0)
+	if err := checkGens(0); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestCache_maxItems(t *testing.T) {
 	c := New(2, 100*time.Millisecond)
 	c.MaxItems = 1
@@ -151,28 +259,6 @@ func TestCache_GetOrSet_oneByOneMultipleRoutines(t *testing.T) {
 		})
 	}
 }
-
-// func TestCache_GetOrSet_fewKeysManyWriters(t *testing.T) {
-// 	c := New(1, time.Hour)
-
-// 	for r := 0; r < 10; r++ {
-// 		r := r
-// 		t.Run(fmt.Sprintf("r=%d", r), func(t *testing.T) {
-// 			t.Parallel()
-
-// 			for k := 0; k < 1000; k++ {
-// 				v, err := c.GetOrSet(nil, k%10, func() (interface{}, error) { return 1000 + r + k, nil })
-// 				if err != nil {
-// 					t.Fatal(err)
-// 				}
-// 				// we should only get the very first value
-// 				if v != 1000+r {
-// 					t.Errorf("[%d] unexpected value: %v", k, v)
-// 				}
-// 			}
-// 		})
-// 	}
-// }
 
 func TestCache_GetOrSet_random(t *testing.T) {
 	c := New(1, time.Hour)

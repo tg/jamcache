@@ -15,14 +15,23 @@ type Cache struct {
 	// MaxItems specifies maximum number of items in cache (across all generations).
 	MaxItems int
 
-	lock   sync.RWMutex
-	gens   []items
+	// gens keep the generations, the newest (current) comes first
+	gens []items
+
+	// genDur specifies duration of a single generation
 	genDur time.Duration
+
+	// lock protects generations
+	genLock sync.RWMutex
+
 	// head points to the end of current generation
 	head time.Time
+
+	// size tracks number of elements in the cache. It doesn't necessary track unique
+	// elements in cache as one key can be present in multiple generations.
 	size int
 
-	// rungc is a flag used in Get() to run rotate
+	// rungc is set to 1 in Get() to indicate gc is needed
 	rungc int64
 
 	// keySetChan holds channels for syncing GetOrSet method
@@ -64,12 +73,12 @@ func NewAtMost(dur time.Duration) *Cache {
 
 // Set adds (key, val) to the set. It is always placed in the newest generation.
 func (c *Cache) Set(key, val interface{}) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.genLock.Lock()
+	defer c.genLock.Unlock()
 
 	// check if we need rotation
 	if now := time.Now(); now.After(c.head) {
-		c.rotate(now)
+		c.gc(now)
 	}
 
 	// delete one element if at or over the size limit
@@ -89,23 +98,22 @@ func (c *Cache) Set(key, val interface{}) {
 func (c *Cache) Get(key interface{}) (interface{}, bool) {
 	now := time.Now()
 	var (
-		val   interface{}
-		found bool
-		rungc bool
+		val      interface{}
+		found    bool
+		gcCaller bool
 	)
 
-	c.lock.RLock()
+	c.genLock.RLock()
 
 	// Get number of valid generations
 	ng := c.vgens(now)
 
 	// Mark for rotation if not all generations are valid and cache has been
-	// initialized. We use CompareAndSwap to make sure only one Get() runs rotation.
-	// TODO: as we need to grab a lock later for this operation and we do it in Set
-	// anyway (which is prefarable), we could add some slack here in case Set is called regularly.
+	// initialized. We use CompareAndSwap to pick only one caller (we don't want to
+	// run GC in every Get). rungc flag will be cleared in gc().
 	if ng != len(c.gens) {
 		if !c.head.IsZero() {
-			rungc = atomic.CompareAndSwapInt64(&c.rungc, 0, 1)
+			gcCaller = atomic.CompareAndSwapInt64(&c.rungc, 0, 1)
 		}
 	}
 
@@ -118,14 +126,13 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 		}
 	}
 
-	c.lock.RUnlock()
+	c.genLock.RUnlock()
 
-	// Rotate cache if GC flag set
-	if rungc {
-		c.lock.Lock()
-		c.rotate(now)
-		c.rungc = 0
-		c.lock.Unlock()
+	// Run GC if we're a gc caller and nobody (Set) run it in a meantime
+	if gcCaller && (atomic.LoadInt64(&c.rungc) == 1) {
+		c.genLock.Lock()
+		c.gc(now)
+		c.genLock.Unlock()
 	}
 
 	return val, found
@@ -212,12 +219,16 @@ func (c *Cache) vgens(ts time.Time) int {
 // Len returns number of items in cache.
 func (c *Cache) Len() int {
 	// TODO: this can be implemented using atomic
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	c.genLock.RLock()
+	defer c.genLock.RUnlock()
 	return c.size
 }
 
-func (c *Cache) rotate(ts time.Time) {
+// gc rotates generations by removing expired and making space for the new ones.
+// It must be called within a genLock. Passed time indicates latest timestamp.
+func (c *Cache) gc(ts time.Time) {
+	c.rungc = 0
+
 	// get valid generations
 	gens := c.gens[:c.vgens(ts)]
 
@@ -226,6 +237,7 @@ func (c *Cache) rotate(ts time.Time) {
 		return
 	}
 
+	// move valid generations to the end
 	c.size = 0
 	wn := len(c.gens) - 1
 	rn := len(gens) - 1
@@ -236,6 +248,7 @@ func (c *Cache) rotate(ts time.Time) {
 		wn--
 	}
 
+	// clear new generations
 	for ; wn >= 0; wn-- {
 		c.gens[wn] = nil
 	}
