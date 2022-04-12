@@ -35,8 +35,17 @@ type Cache struct {
 	rungc int64
 
 	// keySetChan holds channels for syncing GetOrSet method
-	keySetChan     map[interface{}]chan struct{}
+	keySetChan     map[interface{}]*getOrSetDone
 	keySetChanLock sync.Mutex
+}
+
+type getOrSetDone struct {
+	// done will be closed by the setter
+	done chan struct{}
+	// ok will be set to true if the value was fetched
+	ok bool
+	// value will hold fetched value
+	value interface{}
 }
 
 type items map[interface{}]interface{}
@@ -53,7 +62,7 @@ func New(n int, dur time.Duration) *Cache {
 	return &Cache{
 		gens:       make([]items, n),
 		genDur:     dur,
-		keySetChan: make(map[interface{}]chan struct{}),
+		keySetChan: make(map[interface{}]*getOrSetDone),
 	}
 }
 
@@ -143,48 +152,61 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 // will wait for it to finish. Waiting can be aborted by cancelling the context.
 // Retruns the value and error passed from the call to loadValue.
 func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
-	for {
-		// check in the cache first
-		if v, ok := c.Get(key); ok {
-			return v, nil
-		}
+	// check in the cache first
+	if v, ok := c.Get(key); ok {
+		return v, nil
+	}
 
-		// fetch will be set to true if we're responsible for fetching the value
-		var fetch bool
+	for {
+		// doLoad will be set to true if we're responsible for loading the value
+		var doLoad bool
 
 		// grab the key channel (so there is only one fetcher)
 		c.keySetChanLock.Lock()
 		done := c.keySetChan[key]
 		if done == nil {
-			done = make(chan struct{})
+			done = &getOrSetDone{done: make(chan struct{})}
 			c.keySetChan[key] = done
-			fetch = true
+			doLoad = true
 		}
 		c.keySetChanLock.Unlock()
 
-		if fetch {
+		if doLoad {
 			// once we fetch let others know and remove the done channel
 			defer func() {
-				close(done)
+				close(done.done)
 				c.keySetChanLock.Lock()
 				delete(c.keySetChan, key)
 				c.keySetChanLock.Unlock()
 			}()
 
-			// check again in cache in case it was added in the meantime
-			// (it's possible when done channel is removed just after the first Get)
-			if v, ok := c.Get(key); ok {
+			// get the value
+			v, err := func() (interface{}, error) {
+				// check again in cache in case it was added in the meantime
+				// (it's possible when done channel is removed just after the first Get)
+				if v, ok := c.Get(key); ok {
+					done.ok = true
+					done.value = v
+					return v, nil
+				}
+
+				// load the value
+				v, err := loadValue()
+				if err != nil {
+					return v, err
+				}
+
+				// set value in the cache
+				c.Set(key, v)
 				return v, nil
+			}()
+
+			// save the value for the waiters
+			if err == nil {
+				done.ok = true
+				done.value = v
 			}
 
-			// fetch the value
-			v, err := loadValue()
-			if err != nil {
-				return v, err
-			}
-
-			// set value in the cache
-			c.Set(key, v)
 			return v, nil
 		} else {
 			// use default context if missing
@@ -192,10 +214,15 @@ func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() 
 				ctx = context.Background()
 			}
 
-			// Wait for the fetcher to finish. We will grab the value from the
-			// cache in the next iteration.
+			// Wait for the fetcher to finish
 			select {
-			case <-done:
+			case <-done.done:
+				// if the value was fetched by the setter then return it;
+				// otherwise (due to an error) we will try to fetch it again
+				// in the next iteration.
+				if done.ok {
+					return done.value, nil
+				}
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
