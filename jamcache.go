@@ -1,7 +1,13 @@
 // jamcache == [j]ust [a] [m]ap [cache]
-// jamcache aims at low overhead and hence uses only a single structure to cache
-// items. Instead of tracking LRU etc. it keeps items in generations and drops
-// whole generations once they expire.
+//
+// jamcache is a key-value cache which aims at low memory overhead. Every cached item is kept only once
+// (in a map) without any additional metadata. Instead of tracking LRU etc. jamcache keeps multiple
+// maps (generations) and drops them once they expire – this makes the garbage collection very efficient,
+// but forces all the items to share the same TTL.
+//
+// Number of generations is defined at cache creation. The more generation we have, the better
+// accuracy of TTL, but in order to check the key we need to query more maps. If there is only one
+// generation defined, the cache behaves like a single map which is cleared periodically.
 package jamcache
 
 import (
@@ -11,6 +17,7 @@ import (
 	"time"
 )
 
+// Cache implements key-value cache using one or more maps and with a single (shared) TTL.
 type Cache struct {
 	// MaxItems specifies maximum number of items in cache (across all generations).
 	MaxItems int
@@ -39,6 +46,9 @@ type Cache struct {
 	keySetChanLock sync.Mutex
 }
 
+// items holds key-value pairs for a generation
+type items map[interface{}]interface{}
+
 type getOrSetDone struct {
 	// done will be closed by the setter
 	done chan struct{}
@@ -48,12 +58,10 @@ type getOrSetDone struct {
 	value interface{}
 }
 
-type items map[interface{}]interface{}
-
 const DefaultNumOfGenerations = 3
 
 // New creates new cache with n generations, each holding specified duration.
-// Returned cache is nil iff any of the arguments is invalid.
+// Returned cache is nil iff any of the arguments is invalid (non-positive).
 func New(n int, dur time.Duration) *Cache {
 	if n <= 0 || dur <= 0 {
 		return nil
@@ -150,6 +158,11 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 // GetOrSet gets the values from the cache and if it's not present then loads it by calling loadValue.
 // When there are multiple simultaneous calls for the same key, only one will load the value and other
 // will wait for it to finish. Waiting can be aborted by cancelling the context.
+//
+// This function only makes sense when there are possibly multiple routines running Set on the same key.
+// If there is only one routine (at given time) setting a given key then there is better to use
+// Get and Set separately as we don't need any coordination between setters.
+//
 // Returns the value and error passed from the call to loadValue.
 func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
 	// check in the cache first
