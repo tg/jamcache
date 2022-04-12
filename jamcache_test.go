@@ -272,12 +272,15 @@ func TestCache_GetOrSet_random(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			key := rand.Intn(size)
-			_, err := c.GetOrSet(nil, key, func() (interface{}, error) {
+			got, err := c.GetOrSet(nil, key, func() (interface{}, error) {
 				atomic.AddInt64(&access[key], 1)
 				return -key, nil
 			})
 			if err != nil {
 				panic(err)
+			}
+			if v := got.(int); v != -key {
+				t.Errorf("got %d, expected %d", v, -key)
 			}
 		}()
 	}
