@@ -307,7 +307,7 @@ func TestCache_GetOrSet_random(t *testing.T) {
 	}
 }
 
-func BenchmarkCache_GetOrSet(b *testing.B) {
+func BenchmarkCache_GetOrSet_uniqueKeys(b *testing.B) {
 	c := New(3, time.Hour)
 
 	var key int64
@@ -334,19 +334,19 @@ func BenchmarkCache_GetOrSet(b *testing.B) {
 	}
 }
 
-func BenchmarkCache_GetOrSet2(b *testing.B) {
-	c := New(3, time.Hour)
-
+func BenchmarkCache_GetOrSet_10keys(b *testing.B) {
 	var key int64
 
 	for n := 0; n < b.N; n++ {
+		c := New(10, time.Microsecond)
+
 		var wg sync.WaitGroup
 		for r := 0; r < 10; r++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for k := 0; k < 100; k++ {
-					// generate ubnique key for all operations
+				for k := 0; k < 1000; k++ {
+					// choose from 10 keys
 					atomic.AddInt64(&key, 1)
 					key = key % 10
 					_, err := c.GetOrSet(nil, key, func() (interface{}, error) {
