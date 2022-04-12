@@ -207,7 +207,7 @@ func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() 
 				done.value = v
 			}
 
-			return v, nil
+			return v, err
 		} else {
 			// use default context if missing
 			if ctx == nil {
