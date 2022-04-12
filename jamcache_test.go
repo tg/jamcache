@@ -333,3 +333,31 @@ func BenchmarkCache_GetOrSet(b *testing.B) {
 		wg.Wait()
 	}
 }
+
+func BenchmarkCache_GetOrSet2(b *testing.B) {
+	c := New(3, time.Hour)
+
+	var key int64
+
+	for n := 0; n < b.N; n++ {
+		var wg sync.WaitGroup
+		for r := 0; r < 10; r++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for k := 0; k < 100; k++ {
+					// generate ubnique key for all operations
+					atomic.AddInt64(&key, 1)
+					key = key % 10
+					_, err := c.GetOrSet(nil, key, func() (interface{}, error) {
+						return nil, nil
+					})
+					if err != nil {
+						panic(err)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+}
