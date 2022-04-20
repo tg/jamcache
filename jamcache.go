@@ -18,6 +18,8 @@ import (
 )
 
 // Cache implements key-value cache using one or more maps and with a single (shared) TTL.
+//
+// An empty or nil Cache is a valid object, but they differ slightly in GetOrSet method.
 type Cache struct {
 	// MaxItems specifies maximum number of items in cache (across all generations).
 	MaxItems int
@@ -25,14 +27,15 @@ type Cache struct {
 	// gens keep the generations, the newest (current) comes first
 	gens []items
 
-	// genDur specifies duration of a single generation
+	// genDur specifies duration of a single generation for automatic garbage-collecting;
+	// if zero or less then there is no gc.
 	genDur time.Duration
+
+	// head points to the end of current generation (only set when genDur > 0)
+	head time.Time
 
 	// lock protects generations
 	genLock sync.RWMutex
-
-	// head points to the end of current generation
-	head time.Time
 
 	// size tracks number of elements in the cache. It doesn't necessary track unique
 	// elements in cache as one key can be present in multiple generations.
@@ -61,10 +64,15 @@ type getOrSetDone struct {
 const DefaultNumOfGenerations = 3
 
 // New creates new cache with n generations, each holding specified duration.
-// Returned cache is nil iff any of the arguments is invalid (non-positive).
+//
+// If number of generations is zero or less then returned cache is equivalent to an non-initialized
+// cache. In this case cache doesn't store anything, Get returns false and GetOrSet performs only
+// a synchronization to avoid multiple loads in-flight.
+//
+// If duration is zero or less then no automatic garbage collection is performed (no TTL).
 func New(n int, dur time.Duration) *Cache {
-	if n <= 0 || dur <= 0 {
-		return nil
+	if n <= 0 {
+		return &Cache{}
 	}
 
 	return &Cache{
@@ -90,17 +98,28 @@ func NewAtMost(dur time.Duration) *Cache {
 
 // Set adds (key, val) to the set. It is always placed in the newest generation.
 func (c *Cache) Set(key, val interface{}) {
+	if c == nil || len(c.gens) == 0 {
+		return
+	}
+
 	c.genLock.Lock()
 	defer c.genLock.Unlock()
 
 	// check if we need rotation
-	if now := time.Now(); now.After(c.head) {
-		c.gc(now)
+	if c.genDur > 0 {
+		if now := time.Now(); now.After(c.head) {
+			c.gc(now)
+		}
 	}
 
 	// delete one element if at or over the size limit
 	if c.MaxItems > 0 && c.size >= c.MaxItems {
 		c.deleteOne()
+	}
+
+	// initialize map if nil
+	if c.gens[0] == nil {
+		c.gens[0] = make(items)
 	}
 
 	// take the current size, so we know if it changed after setting the key
@@ -113,6 +132,10 @@ func (c *Cache) Set(key, val interface{}) {
 // Get returns the most recent value for the key.
 // If key is not in cache then (nil, false) is returned, otherwise (value, true).
 func (c *Cache) Get(key interface{}) (interface{}, bool) {
+	if c == nil || len(c.gens) == 0 {
+		return nil, false
+	}
+
 	now := time.Now()
 	var (
 		val      interface{}
@@ -134,7 +157,7 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 		}
 	}
 
-	// Find first occurence of key
+	// Find first occurrence of key
 	for _, g := range c.gens[:ng] {
 		if v, ok := g[key]; ok {
 			val = v
@@ -163,8 +186,14 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 // If there is only one routine (at given time) setting a given key then there is better to use
 // Get and Set separately as we don't need any coordination between setters.
 //
+// There is no synchronization when Cache is nil and the call is equivalent to calling loadValue.
+//
 // Returns the value and error passed from the call to loadValue.
 func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
+	if c == nil {
+		return loadValue()
+	}
+
 	// check in the cache first
 	if v, ok := c.Get(key); ok {
 		return v, nil
@@ -179,6 +208,9 @@ func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() 
 		done := c.keySetChan[key]
 		if done == nil {
 			done = &getOrSetDone{done: make(chan struct{})}
+			if c.keySetChan == nil {
+				c.keySetChan = make(map[interface{}]*getOrSetDone)
+			}
 			c.keySetChan[key] = done
 			doLoad = true
 		}
@@ -246,7 +278,7 @@ func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() 
 // vgens returns valid (non-expired) generations for the timestamp
 func (c *Cache) vgens(ts time.Time) int {
 	td := ts.Sub(c.head)
-	if td > 0 {
+	if td > 0 && c.genDur > 0 {
 		n := len(c.gens) - (int(td/c.genDur) + 1)
 		if n < 0 {
 			n = 0
@@ -291,11 +323,6 @@ func (c *Cache) gc(ts time.Time) {
 	// clear new generations
 	for ; wn >= 0; wn-- {
 		c.gens[wn] = nil
-	}
-
-	// make sure current generation is initialized
-	if c.gens[0] == nil {
-		c.gens[0] = make(items)
 	}
 
 	c.head = ts.Truncate(c.genDur).Add(c.genDur)

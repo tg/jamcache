@@ -479,3 +479,65 @@ func BenchmarkCache_GetOrSet_10keys(b *testing.B) {
 		wg.Wait()
 	}
 }
+
+func TestCache_default(t *testing.T) {
+	testFunc := func(t *testing.T, c *Cache) {
+		if v, ok := c.Get("key"); v != nil || ok {
+			t.Error(v, ok)
+		}
+
+		c.Set("key", "val")
+
+		// Set shouldn't set anything
+		if v, ok := c.Get("key"); v != nil || ok {
+			t.Error(v, ok)
+		}
+
+		// GetOrSet returns loaded value
+		if v, err := c.GetOrSet(nil, "key2", func() (interface{}, error) {
+			return "val2", nil
+		}); err != nil || v == nil || v.(string) != "val2" {
+			t.Error(v, err)
+		}
+	}
+
+	t.Run("nil", func(t *testing.T) {
+		testFunc(t, nil)
+	})
+	t.Run("empty", func(t *testing.T) {
+		testFunc(t, &Cache{})
+	})
+	t.Run("new-0-0", func(t *testing.T) {
+		testFunc(t, New(0, 0))
+	})
+	t.Run("new-0-1", func(t *testing.T) {
+		testFunc(t, New(0, 1))
+	})
+}
+
+func TestCache_noDuration(t *testing.T) {
+	testFunc := func(t *testing.T, c *Cache) {
+		if v, ok := c.Get("key"); v != nil || ok {
+			t.Error(v, ok)
+		}
+
+		c.Set("key", "val")
+
+		if v, ok := c.Get("key"); !ok || v.(string) != "val" {
+			t.Error(v, ok)
+		}
+
+		if v, err := c.GetOrSet(nil, "key2", func() (interface{}, error) {
+			return "val2", nil
+		}); err != nil || v == nil || v.(string) != "val2" {
+			t.Error(v, err)
+		}
+	}
+
+	t.Run("new-1-0", func(t *testing.T) {
+		testFunc(t, New(1, 0))
+	})
+	t.Run("new-2-0", func(t *testing.T) {
+		testFunc(t, New(2, 0))
+	})
+}
