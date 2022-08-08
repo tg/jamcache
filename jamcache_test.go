@@ -225,11 +225,11 @@ func TestCache_expireAll(t *testing.T) {
 	}
 }
 
-func TestCache_GetOrSet_oneByOne(t *testing.T) {
+func TestCache_GetOrSetOnce_oneByOne(t *testing.T) {
 	c := New(1, time.Hour)
 
 	for k := 0; k < 10; k++ {
-		v, err := c.GetOrSet(nil, 1, func() (interface{}, error) { return 10 + k, nil })
+		v, err := c.GetOrSetOnce(nil, 1, func() (interface{}, error) { return 10 + k, nil })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -240,7 +240,7 @@ func TestCache_GetOrSet_oneByOne(t *testing.T) {
 	}
 }
 
-func TestCache_GetOrSet_oneByOneMultipleRoutines(t *testing.T) {
+func TestCache_GetOrSetOnce_oneByOneMultipleRoutines(t *testing.T) {
 	c := New(1, time.Hour)
 
 	for r := 0; r < 10; r++ {
@@ -249,7 +249,7 @@ func TestCache_GetOrSet_oneByOneMultipleRoutines(t *testing.T) {
 			t.Parallel()
 
 			for k := 0; k < 1000; k++ {
-				v, err := c.GetOrSet(nil, r, func() (interface{}, error) { return 1000 + r + k, nil })
+				v, err := c.GetOrSetOnce(nil, r, func() (interface{}, error) { return 1000 + r + k, nil })
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -262,7 +262,7 @@ func TestCache_GetOrSet_oneByOneMultipleRoutines(t *testing.T) {
 	}
 }
 
-func TestCache_GetOrSet_random(t *testing.T) {
+func TestCache_GetOrSetOnce_random(t *testing.T) {
 	c := New(1, time.Hour)
 
 	size := 100
@@ -274,7 +274,7 @@ func TestCache_GetOrSet_random(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			key := rand.Intn(size)
-			got, err := c.GetOrSet(nil, key, func() (interface{}, error) {
+			got, err := c.GetOrSetOnce(nil, key, func() (interface{}, error) {
 				atomic.AddInt64(&access[key], 1)
 				return -key, nil
 			})
@@ -309,7 +309,7 @@ func TestCache_GetOrSet_random(t *testing.T) {
 	}
 }
 
-func TestCache_GetOrSet_error(t *testing.T) {
+func TestCache_GetOrSetOnce_error(t *testing.T) {
 	c := New(1, time.Hour)
 	someError := errors.New("some error")
 
@@ -318,7 +318,7 @@ func TestCache_GetOrSet_error(t *testing.T) {
 
 		// Set value for n=10, otherwise error. The function shouln't be called
 		// after the value was returned (as it will be in cache).
-		v, err := c.GetOrSet(nil, 1, func() (interface{}, error) {
+		v, err := c.GetOrSetOnce(nil, 1, func() (interface{}, error) {
 			if n != 10 {
 				return nil, someError
 			}
@@ -341,16 +341,16 @@ func TestCache_GetOrSet_error(t *testing.T) {
 	}
 }
 
-func TestCache_GetOrSet_errorWithWaiter(t *testing.T) {
+func TestCache_GetOrSetOnce_errorWithWaiter(t *testing.T) {
 	c := New(1, time.Hour)
 	someError := errors.New("some error")
 
 	res := make(chan interface{})
 
-	v, err := c.GetOrSet(nil, 1, func() (interface{}, error) {
+	v, err := c.GetOrSetOnce(nil, 1, func() (interface{}, error) {
 		// run another setter in the background
 		go func() {
-			v, err := c.GetOrSet(nil, 1, func() (interface{}, error) {
+			v, err := c.GetOrSetOnce(nil, 1, func() (interface{}, error) {
 				return 20, nil
 			})
 			if err != nil {
@@ -379,7 +379,7 @@ func TestCache_GetOrSet_errorWithWaiter(t *testing.T) {
 	}
 }
 
-func TestCache_GetOrSet_cancelWaiter(t *testing.T) {
+func TestCache_GetOrSetOnce_cancelWaiter(t *testing.T) {
 	c := New(1, time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -392,9 +392,9 @@ func TestCache_GetOrSet_cancelWaiter(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		v, err := c.GetOrSet(ctx, 1, func() (interface{}, error) {
+		v, err := c.GetOrSetOnce(ctx, 1, func() (interface{}, error) {
 			go func() {
-				v, err := c.GetOrSet(ctx, 1, func() (interface{}, error) {
+				v, err := c.GetOrSetOnce(ctx, 1, func() (interface{}, error) {
 					t.Error("this shouldn't be called")
 					return nil, nil
 				})
@@ -425,7 +425,7 @@ func TestCache_GetOrSet_cancelWaiter(t *testing.T) {
 	wg.Wait()
 }
 
-func BenchmarkCache_GetOrSet_uniqueKeys(b *testing.B) {
+func BenchmarkCache_GetOrSetOnce_uniqueKeys(b *testing.B) {
 	c := New(3, time.Hour)
 
 	var key int64
@@ -439,7 +439,7 @@ func BenchmarkCache_GetOrSet_uniqueKeys(b *testing.B) {
 				for k := 0; k < 100; k++ {
 					// generate ubnique key for all operations
 					atomic.AddInt64(&key, 1)
-					_, err := c.GetOrSet(nil, key, func() (interface{}, error) {
+					_, err := c.GetOrSetOnce(nil, key, func() (interface{}, error) {
 						return nil, nil
 					})
 					if err != nil {
@@ -452,7 +452,7 @@ func BenchmarkCache_GetOrSet_uniqueKeys(b *testing.B) {
 	}
 }
 
-func BenchmarkCache_GetOrSet_10keys(b *testing.B) {
+func BenchmarkCache_GetOrSetOnce_10keys(b *testing.B) {
 	var key int64
 
 	for n := 0; n < b.N; n++ {
@@ -467,7 +467,7 @@ func BenchmarkCache_GetOrSet_10keys(b *testing.B) {
 					// choose from 10 keys
 					atomic.AddInt64(&key, 1)
 					key = key % 10
-					_, err := c.GetOrSet(nil, key, func() (interface{}, error) {
+					_, err := c.GetOrSetOnce(nil, key, func() (interface{}, error) {
 						return nil, nil
 					})
 					if err != nil {
@@ -493,8 +493,8 @@ func TestCache_default(t *testing.T) {
 			t.Error(v, ok)
 		}
 
-		// GetOrSet returns loaded value
-		if v, err := c.GetOrSet(nil, "key2", func() (interface{}, error) {
+		// GetOrSetOnce returns loaded value
+		if v, err := c.GetOrSetOnce(nil, "key2", func() (interface{}, error) {
 			return "val2", nil
 		}); err != nil || v == nil || v.(string) != "val2" {
 			t.Error(v, err)
@@ -527,7 +527,7 @@ func TestCache_noDuration(t *testing.T) {
 			t.Error(v, ok)
 		}
 
-		if v, err := c.GetOrSet(nil, "key2", func() (interface{}, error) {
+		if v, err := c.GetOrSetOnce(nil, "key2", func() (interface{}, error) {
 			return "val2", nil
 		}); err != nil || v == nil || v.(string) != "val2" {
 			t.Error(v, err)

@@ -178,7 +178,7 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 	return val, found
 }
 
-// GetOrSet gets the values from the cache and if it's not present then loads it by calling loadValue.
+// GetOrSetOnce gets the values from the cache and if it's not present then loads it by calling loadValue.
 // When there are multiple simultaneous calls for the same key, only one will load the value and other
 // will wait for it to finish. Waiting can be aborted by cancelling the context.
 //
@@ -189,7 +189,7 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 // There is no synchronization when Cache is nil and the call is equivalent to calling loadValue.
 //
 // Returns the value and error passed from the call to loadValue.
-func (c *Cache) GetOrSet(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
+func (c *Cache) GetOrSetOnce(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
 	if c == nil {
 		return loadValue()
 	}
