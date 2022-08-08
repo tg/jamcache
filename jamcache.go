@@ -20,12 +20,12 @@ import (
 // Cache implements key-value cache using one or more maps and with a single (shared) TTL.
 //
 // An empty or nil Cache is a valid object, but they differ slightly in GetOrSet method.
-type Cache struct {
+type Cache[K comparable, V any] struct {
 	// MaxItems specifies maximum number of items in cache (across all generations).
 	MaxItems int
 
 	// gens keep the generations, the newest (current) comes first
-	gens []items
+	gens []map[K]V
 
 	// genDur specifies duration of a single generation for automatic garbage-collecting;
 	// if zero or less then there is no gc.
@@ -45,20 +45,17 @@ type Cache struct {
 	rungc int64
 
 	// keySetChan holds channels for syncing GetOrSet method
-	keySetChan     map[interface{}]*getOrSetDone
+	keySetChan     map[K]*getOrSetDone[V]
 	keySetChanLock sync.Mutex
 }
 
-// items holds key-value pairs for a generation
-type items map[interface{}]interface{}
-
-type getOrSetDone struct {
+type getOrSetDone[V any] struct {
 	// done will be closed by the setter
 	done chan struct{}
 	// ok will be set to true if the value was fetched
 	ok bool
 	// value will hold fetched value
-	value interface{}
+	value V
 }
 
 const DefaultNumOfGenerations = 3
@@ -70,34 +67,34 @@ const DefaultNumOfGenerations = 3
 // a synchronization to avoid multiple loads in-flight.
 //
 // If duration is zero or less then no automatic garbage collection is performed (no TTL).
-func New(n int, dur time.Duration) *Cache {
+func New[K comparable, V any](n int, dur time.Duration) *Cache[K, V] {
 	if n <= 0 {
-		return &Cache{}
+		return &Cache[K, V]{}
 	}
 
-	return &Cache{
-		gens:       make([]items, n),
+	return &Cache[K, V]{
+		gens:       make([]map[K]V, n),
 		genDur:     dur,
-		keySetChan: make(map[interface{}]*getOrSetDone),
+		keySetChan: make(map[K]*getOrSetDone[V]),
 	}
 }
 
 // NewAtLeast returns cache which stores elements for at least specified duration.
 // It will use default number of generations.
-func NewAtLeast(dur time.Duration) *Cache {
+func NewAtLeast[K comparable, V any](dur time.Duration) *Cache[K, V] {
 	genDur := dur / time.Duration(DefaultNumOfGenerations-1)
-	return New(DefaultNumOfGenerations, genDur)
+	return New[K, V](DefaultNumOfGenerations, genDur)
 }
 
 // NewAtMost returns cache which stores elements for at most specified duration.
 // It will use default number of generations.
-func NewAtMost(dur time.Duration) *Cache {
+func NewAtMost[K comparable, V any](dur time.Duration) *Cache[K, V] {
 	genDur := dur / time.Duration(DefaultNumOfGenerations)
-	return New(DefaultNumOfGenerations, genDur)
+	return New[K, V](DefaultNumOfGenerations, genDur)
 }
 
 // Set adds (key, val) to the set. It is always placed in the newest generation.
-func (c *Cache) Set(key, val interface{}) {
+func (c *Cache[K, V]) Set(key K, val V) {
 	if c == nil || len(c.gens) == 0 {
 		return
 	}
@@ -119,7 +116,7 @@ func (c *Cache) Set(key, val interface{}) {
 
 	// initialize map if nil
 	if c.gens[0] == nil {
-		c.gens[0] = make(items)
+		c.gens[0] = make(map[K]V)
 	}
 
 	// take the current size, so we know if it changed after setting the key
@@ -130,15 +127,16 @@ func (c *Cache) Set(key, val interface{}) {
 }
 
 // Get returns the most recent value for the key.
-// If key is not in cache then (nil, false) is returned, otherwise (value, true).
-func (c *Cache) Get(key interface{}) (interface{}, bool) {
+// If key is not in cache then (V{}, false) is returned, otherwise (value, true).
+func (c *Cache[K, V]) Get(key K) (V, bool) {
 	if c == nil || len(c.gens) == 0 {
-		return nil, false
+		var zero V
+		return zero, false
 	}
 
 	now := time.Now()
 	var (
-		val      interface{}
+		val      V
 		found    bool
 		gcCaller bool
 	)
@@ -189,7 +187,7 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 // There is no synchronization when Cache is nil and the call is equivalent to calling loadValue.
 //
 // Returns the value and error passed from the call to loadValue.
-func (c *Cache) GetOrSetOnce(ctx context.Context, key interface{}, loadValue func() (interface{}, error)) (interface{}, error) {
+func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() (val V, err error)) (V, error) {
 	if c == nil {
 		return loadValue()
 	}
@@ -207,9 +205,9 @@ func (c *Cache) GetOrSetOnce(ctx context.Context, key interface{}, loadValue fun
 		c.keySetChanLock.Lock()
 		done := c.keySetChan[key]
 		if done == nil {
-			done = &getOrSetDone{done: make(chan struct{})}
+			done = &getOrSetDone[V]{done: make(chan struct{})}
 			if c.keySetChan == nil {
-				c.keySetChan = make(map[interface{}]*getOrSetDone)
+				c.keySetChan = make(map[K]*getOrSetDone[V])
 			}
 			c.keySetChan[key] = done
 			doLoad = true
@@ -225,29 +223,20 @@ func (c *Cache) GetOrSetOnce(ctx context.Context, key interface{}, loadValue fun
 				c.keySetChanLock.Unlock()
 			}()
 
-			// get the value
-			v, err := func() (interface{}, error) {
-				// check again in cache in case it was added in the meantime
-				// (it's possible when done channel is removed just after the first Get)
-				if v, ok := c.Get(key); ok {
-					done.ok = true
-					done.value = v
-					return v, nil
-				}
-
-				// load the value
-				v, err := loadValue()
-				if err != nil {
-					return v, err
-				}
-
-				// set value in the cache
-				c.Set(key, v)
+			// check again in cache in case it was added in the meantime
+			// (it's possible when done channel is removed just after the first Get)
+			if v, ok := c.Get(key); ok {
+				done.ok = true
+				done.value = v
 				return v, nil
-			}()
+			}
 
-			// save the value for the waiters
+			// load the value
+			v, err := loadValue()
+
+			// if all god, set value in the cache and save it for the waiters
 			if err == nil {
+				c.Set(key, v)
 				done.ok = true
 				done.value = v
 			}
@@ -269,14 +258,15 @@ func (c *Cache) GetOrSetOnce(ctx context.Context, key interface{}, loadValue fun
 					return done.value, nil
 				}
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				var zero V
+				return zero, ctx.Err()
 			}
 		}
 	}
 }
 
 // vgens returns valid (non-expired) generations for the timestamp
-func (c *Cache) vgens(ts time.Time) int {
+func (c *Cache[K, V]) vgens(ts time.Time) int {
 	td := ts.Sub(c.head)
 	if td > 0 && c.genDur > 0 {
 		n := len(c.gens) - (int(td/c.genDur) + 1)
@@ -289,7 +279,7 @@ func (c *Cache) vgens(ts time.Time) int {
 }
 
 // Len returns number of items in cache.
-func (c *Cache) Len() int {
+func (c *Cache[K, V]) Len() int {
 	// TODO: this can be implemented using atomic
 	c.genLock.RLock()
 	defer c.genLock.RUnlock()
@@ -298,7 +288,7 @@ func (c *Cache) Len() int {
 
 // gc rotates generations by removing expired and making space for the new ones.
 // It must be called within a genLock. Passed time indicates latest timestamp.
-func (c *Cache) gc(ts time.Time) {
+func (c *Cache[K, V]) gc(ts time.Time) {
 	c.rungc = 0
 
 	// get valid generations
@@ -329,7 +319,7 @@ func (c *Cache) gc(ts time.Time) {
 }
 
 // deleteOne deletes a random element from the oldest generation
-func (c *Cache) deleteOne() {
+func (c *Cache[K, V]) deleteOne() {
 	for n := len(c.gens) - 1; n >= 0; n-- {
 		for k := range c.gens[n] {
 			delete(c.gens[n], k)
