@@ -541,3 +541,57 @@ func TestCache_noDuration(t *testing.T) {
 		testFunc(t, New[string, string](2, 0))
 	})
 }
+
+func TestCache_Delete(t *testing.T) {
+	c := New[int, any](10, 100*time.Millisecond)
+
+	// run Delete on empty Cache
+	c.Delete(0)
+
+	c.Set(1, nil)
+	c.Set(2, nil)
+	sleepUntilRotates(c)
+	c.Set(1, nil)
+	c.Set(3, nil)
+	sleepUntilRotates(c)
+	c.Set(1, nil)
+	c.Set(3, nil)
+	c.Set(4, nil)
+	c.Set(5, nil)
+	c.Set(6, nil)
+	sleepUntilRotates(c)
+
+	if len := c.Len(); len != 9 {
+		t.Fatal(len)
+	}
+
+	// cases
+	toremove := []struct {
+		Remove       []int
+		ExpectedSize int
+	}{
+		{[]int{6}, 8},
+		{[]int{3, 4}, 5},
+		{[]int{1, 2}, 1},
+		{[]int{6}, 1}, // no-op
+		{[]int{5}, 0},
+	}
+
+	for _, tc := range toremove {
+		c.Delete(tc.Remove...)
+		if len := c.Len(); len != tc.ExpectedSize {
+			t.Fatalf("size is %d, expected %d", len, tc.ExpectedSize)
+		}
+		for _, v := range tc.Remove {
+			if _, ok := c.Get(v); ok {
+				t.Errorf("key %d removed, but still there", v)
+			}
+		}
+	}
+
+	// perform some other action at the end
+	c.Set(1, nil)
+	if _, ok := c.Get(1); !ok {
+		t.Error("where is the one?")
+	}
+}

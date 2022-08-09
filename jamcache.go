@@ -102,12 +102,8 @@ func (c *Cache[K, V]) Set(key K, val V) {
 	c.genLock.Lock()
 	defer c.genLock.Unlock()
 
-	// check if we need rotation
-	if c.genDur > 0 {
-		if now := time.Now(); now.After(c.head) {
-			c.gc(now)
-		}
-	}
+	// run GC if needed
+	c.tryGC()
 
 	// delete one element if at or over the size limit
 	if c.MaxItems > 0 && c.size >= c.MaxItems {
@@ -265,6 +261,27 @@ func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() 
 	}
 }
 
+// Delete removes specified keys from the cache.
+func (c *Cache[K, V]) Delete(key ...K) {
+	c.genLock.Lock()
+	defer c.genLock.Unlock()
+
+	// run GC if needed
+	c.tryGC()
+
+	newSize := 0
+
+	// delete keys from all the generations
+	for _, g := range c.gens {
+		for n := range key {
+			delete(g, key[n])
+		}
+		newSize += len(g)
+	}
+
+	c.size = newSize
+}
+
 // vgens returns valid (non-expired) generations for the timestamp
 func (c *Cache[K, V]) vgens(ts time.Time) int {
 	td := ts.Sub(c.head)
@@ -280,10 +297,20 @@ func (c *Cache[K, V]) vgens(ts time.Time) int {
 
 // Len returns number of items in cache.
 func (c *Cache[K, V]) Len() int {
-	// TODO: this can be implemented using atomic
+	// TODO: this can be implemented using atomic (but can't be zeroed in gc/Delete)
 	c.genLock.RLock()
 	defer c.genLock.RUnlock()
 	return c.size
+}
+
+// tryGC run GC if needed.
+// It must be called within a genLock.
+func (c *Cache[K, V]) tryGC() {
+	if c.genDur > 0 {
+		if now := time.Now(); now.After(c.head) {
+			c.gc(now)
+		}
+	}
 }
 
 // gc rotates generations by removing expired and making space for the new ones.
@@ -318,7 +345,8 @@ func (c *Cache[K, V]) gc(ts time.Time) {
 	c.head = ts.Truncate(c.genDur).Add(c.genDur)
 }
 
-// deleteOne deletes a random element from the oldest generation
+// deleteOne deletes a random element from the oldest generation.
+// It must be called within a genLock.
 func (c *Cache[K, V]) deleteOne() {
 	for n := len(c.gens) - 1; n >= 0; n-- {
 		for k := range c.gens[n] {
