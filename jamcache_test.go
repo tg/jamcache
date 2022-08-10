@@ -499,6 +499,9 @@ func TestCache_default(t *testing.T) {
 		}); err != nil || v != "val2" {
 			t.Error(v, err)
 		}
+
+		// and this is a no-op
+		c.Delete("key")
 	}
 
 	t.Run("nil", func(t *testing.T) {

@@ -262,7 +262,11 @@ func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() 
 }
 
 // Delete removes specified keys from the cache.
-func (c *Cache[K, V]) Delete(key ...K) {
+func (c *Cache[K, V]) Delete(keys ...K) {
+	if c == nil || len(keys) == 0 {
+		return
+	}
+
 	c.genLock.Lock()
 	defer c.genLock.Unlock()
 
@@ -273,8 +277,8 @@ func (c *Cache[K, V]) Delete(key ...K) {
 
 	// delete keys from all the generations
 	for _, g := range c.gens {
-		for n := range key {
-			delete(g, key[n])
+		for n := range keys {
+			delete(g, keys[n])
 		}
 		newSize += len(g)
 	}
