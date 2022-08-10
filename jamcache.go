@@ -19,7 +19,7 @@ import (
 
 // Cache implements key-value cache using one or more maps and with a single (shared) TTL.
 //
-// An empty or nil Cache is a valid object, but they differ slightly in GetOrSet method.
+// An empty or nil Cache is a valid object, but they differ slightly in GetOrSetOnce method.
 type Cache[K comparable, V any] struct {
 	// MaxItems specifies maximum number of items in cache (across all generations).
 	MaxItems int
@@ -44,7 +44,7 @@ type Cache[K comparable, V any] struct {
 	// rungc is set to 1 in Get() to indicate gc is needed
 	rungc int64
 
-	// keySetChan holds channels for syncing GetOrSet method
+	// keySetChan holds channels for syncing GetOrSetOnce method
 	keySetChan     map[K]*getOrSetDone[V]
 	keySetChanLock sync.Mutex
 }
@@ -63,7 +63,7 @@ const DefaultNumOfGenerations = 3
 // New creates new cache with n generations, each holding specified duration.
 //
 // If number of generations is zero or less then returned cache is equivalent to an non-initialized
-// cache. In this case cache doesn't store anything, Get returns false and GetOrSet performs only
+// cache. In this case cache doesn't store anything, Get returns false and GetOrSetOnce performs only
 // a synchronization to avoid multiple loads in-flight.
 //
 // If duration is zero or less then no automatic garbage collection is performed (no TTL).
