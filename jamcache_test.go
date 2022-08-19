@@ -341,44 +341,6 @@ func TestCache_GetOrSetOnce_error(t *testing.T) {
 	}
 }
 
-func TestCache_GetOrSetOnce_errorWithWaiter(t *testing.T) {
-	c := New[int, int](1, time.Hour)
-	someError := errors.New("some error")
-
-	res := make(chan interface{})
-
-	v, err := c.GetOrSetOnce(nil, 1, func() (int, error) {
-		// run another setter in the background
-		go func() {
-			v, err := c.GetOrSetOnce(nil, 1, func() (int, error) {
-				return 20, nil
-			})
-			if err != nil {
-				t.Error(err)
-			}
-			res <- v
-		}()
-
-		time.Sleep(time.Millisecond)
-
-		// return error from the first call
-		return 10, someError
-	})
-
-	// outer call returns error
-	if err != someError {
-		t.Error(err)
-	}
-	if v != 10 {
-		t.Error(v)
-	}
-
-	// make sure we get the valid value from the waiter (inner call)
-	if v := <-res; v.(int) != 20 {
-		t.Errorf("unexpected value: %v", v)
-	}
-}
-
 func TestCache_GetOrSetOnce_cancelWaiter(t *testing.T) {
 	c := New[int, int](1, time.Hour)
 
@@ -425,58 +387,68 @@ func TestCache_GetOrSetOnce_cancelWaiter(t *testing.T) {
 	wg.Wait()
 }
 
-func BenchmarkCache_GetOrSetOnce_uniqueKeys(b *testing.B) {
-	c := New[int64, int](3, time.Hour)
+type benchFunc func(b *testing.B, key int64)
 
+func runBench(b *testing.B, fn benchFunc) {
 	var key int64
 
+	var wg sync.WaitGroup
+	for r := 0; r < 10; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := 0; k < 1000; k++ {
+				// run func with unique key
+				fn(b, atomic.AddInt64(&key, 1))
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkCache_GetAndSet_uniqueKeys(b *testing.B) {
 	for n := 0; n < b.N; n++ {
-		var wg sync.WaitGroup
-		for r := 0; r < 10; r++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for k := 0; k < 100; k++ {
-					// generate ubnique key for all operations
-					atomic.AddInt64(&key, 1)
-					_, err := c.GetOrSetOnce(nil, key, func() (int, error) {
-						return 0, nil
-					})
-					if err != nil {
-						panic(err)
-					}
-				}
-			}()
-		}
-		wg.Wait()
+		c := New[int64, int](3, time.Hour)
+
+		runBench(b, func(b *testing.B, key int64) {
+			if _, ok := c.Get(key); ok {
+				b.Errorf("key %q is set?", key)
+			}
+			c.Set(key, 0)
+		})
+	}
+}
+
+func BenchmarkCache_GetOrSetOnce_uniqueKeys(b *testing.B) {
+	for n := 0; n < b.N; n++ {
+		c := New[int64, int](3, time.Hour)
+
+		runBench(b, func(b *testing.B, key int64) {
+			_, err := c.GetOrSetOnce(nil, key, func() (int, error) {
+				return 0, nil
+			})
+			if err != nil {
+				b.Error(err)
+			}
+
+		})
 	}
 }
 
 func BenchmarkCache_GetOrSetOnce_10keys(b *testing.B) {
-	var key int64
-
 	for n := 0; n < b.N; n++ {
 		c := New[int64, int](10, time.Microsecond)
 
-		var wg sync.WaitGroup
-		for r := 0; r < 10; r++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for k := 0; k < 1000; k++ {
-					// choose from 10 keys
-					atomic.AddInt64(&key, 1)
-					key = key % 10
-					_, err := c.GetOrSetOnce(nil, key, func() (int, error) {
-						return 0, nil
-					})
-					if err != nil {
-						panic(err)
-					}
-				}
-			}()
-		}
-		wg.Wait()
+		runBench(b, func(b *testing.B, key int64) {
+			key = key % 10
+			_, err := c.GetOrSetOnce(nil, key, func() (int, error) {
+				return 0, nil
+			})
+			if err != nil {
+				b.Error(err)
+			}
+
+		})
 	}
 }
 
