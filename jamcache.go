@@ -130,65 +130,55 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		return zero, false
 	}
 
-	var (
-		val   V
-		found bool
-	)
-
-	c.get(key, func(v V, ok bool) {
-		val = v
-		found = ok
-	})
-
-	return val, found
+	return c.get(key, nil)
 }
 
-// get gets the value from the cache and call fn with value and boolean indicating
-// if the value was found. fn is called within the read lock, which means cache cannot
-// be modified while fn is being executed.
-func (c *Cache[K, V]) get(key K, fn func(V, bool)) {
+// get gets the value from the cache and return the value and boolean indicating
+// if the value was found. If onMiss is provided and key is not found, onMiss is
+// called within the read lock (which means cache cannot be modified during the call).
+func (c *Cache[K, V]) get(key K, onMiss func()) (V, bool) {
 	now := time.Now()
-	var (
-		val      V
-		found    bool
-		gcCaller bool
-	)
 
+	// Acquire read lock
 	c.genLock.RLock()
 
 	// Get number of valid generations
 	ng := c.vgens(now)
 
-	// Mark for rotation if not all generations are valid and cache has been
-	// initialized. We use CompareAndSwap to pick only one caller (we don't want to
-	// run GC in every Get). rungc flag will be cleared in gc().
-	if ng != len(c.gens) {
-		if !c.head.IsZero() {
-			gcCaller = atomic.CompareAndSwapInt64(&c.rungc, 0, 1)
+	// Run GC at return if we're a gc caller and nobody (Set) run it in a meantime.
+
+	// If not all generations are valid and cache has been, try to mark for rotation
+	if ng != len(c.gens) && !c.head.IsZero() {
+		// Use CompareAndSwap to pick only one caller (we don't want to run GC in every Get).
+		// rungc flag will be cleared in gc().
+		if atomic.CompareAndSwapInt64(&c.rungc, 0, 1) {
+			// Call gc on return (this needs to be done after releasing the read lock)
+			defer func() {
+				if atomic.LoadInt64(&c.rungc) == 1 {
+					c.genLock.Lock()
+					c.gc(now)
+					c.genLock.Unlock()
+				}
+			}()
 		}
 	}
+
+	// Release the lock on return (needs to be done before GC, hence defer is located here)
+	defer c.genLock.RUnlock()
 
 	// Find first occurrence of key
 	for _, g := range c.gens[:ng] {
 		if v, ok := g[key]; ok {
-			val = v
-			found = true
-			break
+			return v, true
 		}
 	}
 
-	// call fn with the result. We want this to happend within read lock, so
-	// caller can be sure the value is not changed while fn is being called.
-	fn(val, found)
-
-	c.genLock.RUnlock()
-
-	// Run GC if we're a gc caller and nobody (Set) run it in a meantime
-	if gcCaller && (atomic.LoadInt64(&c.rungc) == 1) {
-		c.genLock.Lock()
-		c.gc(now)
-		c.genLock.Unlock()
+	if onMiss != nil {
+		onMiss()
 	}
+
+	var val V
+	return val, false
 }
 
 // GetOrSetOnce gets the values from the cache and if it's not present then loads it by calling loadValue.
@@ -208,9 +198,6 @@ func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() 
 	}
 
 	var (
-		val   V
-		found bool
-
 		// doLoad will be set to true if we're responsible for loading the value
 		doLoad bool
 		done   *getOrSetDone[V]
@@ -218,24 +205,19 @@ func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() 
 
 	// try to get the value from the cache. If found we will simply return,
 	// otherwise we will grab a channel for syncing the load process.
-	c.get(key, func(v V, ok bool) {
-		if ok {
-			val = v
-			found = true
-		} else {
-			c.keySetChanLock.Lock()
-			done = c.keySetChan[key]
-			if done == nil {
-				// create channel and make yourself responsible for the load
-				done = &getOrSetDone[V]{done: make(chan struct{})}
-				if c.keySetChan == nil {
-					c.keySetChan = make(map[K]*getOrSetDone[V])
-				}
-				c.keySetChan[key] = done
-				doLoad = true
+	val, found := c.get(key, func() {
+		c.keySetChanLock.Lock()
+		done = c.keySetChan[key]
+		if done == nil {
+			// create channel and make yourself responsible for the load
+			done = &getOrSetDone[V]{done: make(chan struct{})}
+			if c.keySetChan == nil {
+				c.keySetChan = make(map[K]*getOrSetDone[V])
 			}
-			c.keySetChanLock.Unlock()
+			c.keySetChan[key] = done
+			doLoad = true
 		}
+		c.keySetChanLock.Unlock()
 	})
 
 	if found {
