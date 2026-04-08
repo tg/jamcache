@@ -56,6 +56,8 @@ type getOrSetDone[V any] struct {
 	value V
 	// err will hold error if any
 	err error
+	// panicValue will hold the recovered panic from loadValue
+	panicValue any
 }
 
 const DefaultNumOfGenerations = 3
@@ -191,7 +193,8 @@ func (c *Cache[K, V]) get(key K, onMiss func()) (V, bool) {
 //
 // There is no synchronization when Cache is nil and the call is equivalent to calling loadValue.
 //
-// Returns the value and error passed from the call to loadValue.
+// Returns the value and error passed from the shared call to loadValue. Concurrent
+// calls for the same key observe the same result, including a possible panic.
 func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() (val V, err error)) (V, error) {
 	if c == nil {
 		return loadValue()
@@ -227,10 +230,16 @@ func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() 
 	if doLoad {
 		// once we fetch let others know and remove the done channel
 		defer func() {
+			if p := recover(); p != nil {
+				done.panicValue = p
+			}
 			close(done.done)
 			c.keySetChanLock.Lock()
 			delete(c.keySetChan, key)
 			c.keySetChanLock.Unlock()
+			if done.panicValue != nil {
+				panic(done.panicValue)
+			}
 		}()
 
 		// load the value
@@ -254,6 +263,9 @@ func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() 
 		// Wait for the fetcher to finish
 		select {
 		case <-done.done:
+			if done.panicValue != nil {
+				panic(done.panicValue)
+			}
 			return done.value, done.err
 		case <-ctx.Done():
 			var zero V

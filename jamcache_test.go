@@ -387,6 +387,77 @@ func TestCache_GetOrSetOnce_cancelWaiter(t *testing.T) {
 	wg.Wait()
 }
 
+func TestCache_GetOrSetOnce_panic(t *testing.T) {
+	c := New[int, int](1, time.Hour)
+
+	defer func() {
+		if p := recover(); p != "boom" {
+			t.Fatalf("unexpected panic: %v", p)
+		}
+		if _, ok := c.Get(1); ok {
+			t.Fatal("value should not be cached after panic")
+		}
+	}()
+
+	_, _ = c.GetOrSetOnce(context.Background(), 1, func() (int, error) {
+		panic("boom")
+	})
+}
+
+func TestCache_GetOrSetOnce_panicWithWaiter(t *testing.T) {
+	c := New[int, int](1, time.Hour)
+	outerPanic := make(chan any, 1)
+	waiterResult := make(chan struct {
+		panicValue   any
+		loaderCalled bool
+		value        int
+		err          error
+	}, 1)
+
+	go func() {
+		defer func() {
+			outerPanic <- recover()
+		}()
+
+		_, _ = c.GetOrSetOnce(t.Context(), 1, func() (int, error) {
+			// run waiter
+			go func() {
+				res := struct {
+					panicValue   any
+					loaderCalled bool
+					value        int
+					err          error
+				}{}
+				defer func() {
+					res.panicValue = recover()
+					waiterResult <- res
+				}()
+
+				res.value, res.err = c.GetOrSetOnce(t.Context(), 1, func() (int, error) {
+					res.loaderCalled = true
+					return 0, nil
+				})
+			}()
+
+			// wait so waiter can enter GetOrSetOnce
+			time.Sleep(100 * time.Millisecond)
+			panic("boom")
+		})
+	}()
+
+	if p := <-outerPanic; p != "boom" {
+		t.Fatalf("unexpected outer panic: %v", p)
+	}
+
+	res := <-waiterResult
+	if res.panicValue != "boom" {
+		t.Fatalf("unexpected waiter panic: %v", res.panicValue)
+	}
+	if res.loaderCalled {
+		t.Fatal("waiter loader should not be called")
+	}
+}
+
 type benchFunc func(b *testing.B, key int64)
 
 func runBench(b *testing.B, fn benchFunc) {
