@@ -44,9 +44,34 @@ type Cache[K comparable, V any] struct {
 	// rungc is set to 1 in Get() to indicate gc is needed
 	rungc int64
 
+	// stats tracks operation statistics
+	stats Stats
+
 	// keySetChan holds channels for syncing GetOrSetOnce method
 	keySetChan     map[K]*getOrSetDone[V]
 	keySetChanLock sync.Mutex
+}
+
+// Stats is a snapshot of a Cache's metrics.
+type Stats struct {
+	// Hits is the cumulative number of successful cache lookups by generation.
+	// Its length is the cache's configured number of generations; index zero is
+	// the newest generation.
+	Hits []uint64
+	// Misses is the cumulative number of unsuccessful cache lookups.
+	Misses uint64
+	// Synced is the cumulative number of GetOrSetOnce calls that joined an
+	// in-flight load. Synced calls are also counted as misses.
+	Synced uint64
+	// Sets is the cumulative number of values stored with Set, including values
+	// stored by GetOrSetOnce.
+	Sets uint64
+	// EvictionsBySize is the cumulative number of entries evicted because the
+	// cache reached MaxItems.
+	EvictionsBySize uint64
+	// EvictionsByTTL is the cumulative number of entries evicted after their
+	// TTL expired.
+	EvictionsByTTL uint64
 }
 
 type getOrSetDone[V any] struct {
@@ -78,6 +103,7 @@ func New[K comparable, V any](n int, dur time.Duration) *Cache[K, V] {
 		gens:       make([]map[K]V, n),
 		genDur:     dur,
 		keySetChan: make(map[K]*getOrSetDone[V]),
+		stats:      Stats{Hits: make([]uint64, n)},
 	}
 }
 
@@ -121,13 +147,19 @@ func (c *Cache[K, V]) Set(key K, val V) {
 	prevSize := len(c.gens[0])
 	c.gens[0][key] = val
 	c.size += len(c.gens[0]) - prevSize
+	atomic.AddUint64(&c.stats.Sets, 1)
 	return
 }
 
 // Get returns the most recent value for the key.
 // If key is not in cache then (V{}, false) is returned, otherwise (value, true).
 func (c *Cache[K, V]) Get(key K) (V, bool) {
-	if c == nil || len(c.gens) == 0 {
+	if c == nil {
+		var zero V
+		return zero, false
+	}
+	if len(c.gens) == 0 {
+		atomic.AddUint64(&c.stats.Misses, 1)
 		var zero V
 		return zero, false
 	}
@@ -169,11 +201,13 @@ func (c *Cache[K, V]) get(key K, onMiss func()) (V, bool) {
 	defer c.genLock.RUnlock()
 
 	// Find first occurrence of key
-	for _, g := range c.gens[:ng] {
+	for n, g := range c.gens[:ng] {
 		if v, ok := g[key]; ok {
+			atomic.AddUint64(&c.stats.Hits[n], 1)
 			return v, true
 		}
 	}
+	atomic.AddUint64(&c.stats.Misses, 1)
 
 	if onMiss != nil {
 		onMiss()
@@ -255,6 +289,8 @@ func (c *Cache[K, V]) GetOrSetOnce(ctx context.Context, key K, loadValue func() 
 		done.err = err
 		return v, err
 	} else {
+		atomic.AddUint64(&c.stats.Synced, 1)
+
 		// use default context if missing
 		if ctx == nil {
 			ctx = context.Background()
@@ -320,6 +356,26 @@ func (c *Cache[K, V]) Len() int {
 	return c.size
 }
 
+// Stats returns a snapshot of cache metrics.
+func (c *Cache[K, V]) Stats() Stats {
+	if c == nil {
+		return Stats{}
+	}
+
+	stats := Stats{
+		Hits:            make([]uint64, len(c.stats.Hits)),
+		Misses:          atomic.LoadUint64(&c.stats.Misses),
+		Synced:          atomic.LoadUint64(&c.stats.Synced),
+		Sets:            atomic.LoadUint64(&c.stats.Sets),
+		EvictionsBySize: atomic.LoadUint64(&c.stats.EvictionsBySize),
+		EvictionsByTTL:  atomic.LoadUint64(&c.stats.EvictionsByTTL),
+	}
+	for n := range stats.Hits {
+		stats.Hits[n] = atomic.LoadUint64(&c.stats.Hits[n])
+	}
+	return stats
+}
+
 // tryGC run GC if needed.
 // It must be called within a genLock.
 func (c *Cache[K, V]) tryGC() {
@@ -344,6 +400,7 @@ func (c *Cache[K, V]) gc(ts time.Time) {
 	}
 
 	// move valid generations to the end
+	oldSize := c.size
 	c.size = 0
 	wn := len(c.gens) - 1
 	rn := len(gens) - 1
@@ -359,6 +416,8 @@ func (c *Cache[K, V]) gc(ts time.Time) {
 		c.gens[wn] = nil
 	}
 
+	atomic.AddUint64(&c.stats.EvictionsByTTL, uint64(oldSize-c.size))
+
 	c.head = ts.Truncate(c.genDur).Add(c.genDur)
 }
 
@@ -369,6 +428,7 @@ func (c *Cache[K, V]) deleteOne() {
 		for k := range c.gens[n] {
 			delete(c.gens[n], k)
 			c.size--
+			atomic.AddUint64(&c.stats.EvictionsBySize, 1)
 			return
 		}
 	}

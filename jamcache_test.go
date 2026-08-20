@@ -207,6 +207,84 @@ func TestCache_maxItems(t *testing.T) {
 	}
 }
 
+func TestCache_Stats(t *testing.T) {
+	c := New[int, int](1, time.Hour)
+	c.MaxItems = 1
+
+	if _, ok := c.Get(1); ok {
+		t.Fatal("unexpected cache hit")
+	}
+	c.Set(1, 10)
+	if _, ok := c.Get(1); !ok {
+		t.Fatal("expected cache hit")
+	}
+
+	// Adding another entry at capacity evicts the first one due to size pressure.
+	c.Set(2, 20)
+
+	// Rotate directly to avoid making this metric test time-dependent.
+	c.genLock.Lock()
+	c.gc(c.head.Add(c.genDur))
+	c.genLock.Unlock()
+
+	if got, want := c.Stats(), (Stats{
+		Misses:          1,
+		Sets:            2,
+		EvictionsBySize: 1,
+		EvictionsByTTL:  1,
+	}); got.Misses != want.Misses || got.Synced != want.Synced || got.Sets != want.Sets || got.EvictionsBySize != want.EvictionsBySize || got.EvictionsByTTL != want.EvictionsByTTL || len(got.Hits) != 1 || got.Hits[0] != 1 {
+		t.Errorf("Stats() = %+v, want %+v", got, want)
+	}
+	if got, want := c.Len(), 0; got != want {
+		t.Errorf("Len() = %d, want %d", got, want)
+	}
+}
+
+func TestCache_Stats_nil(t *testing.T) {
+	var c *Cache[int, int]
+	if got := c.Stats(); len(got.Hits) != 0 || got.Misses != 0 || got.Synced != 0 || got.Sets != 0 || got.EvictionsBySize != 0 || got.EvictionsByTTL != 0 {
+		t.Errorf("Stats() = %+v, want zero stats", got)
+	}
+}
+
+func TestCache_Stats_hitsByGeneration(t *testing.T) {
+	c := New[int, int](3, time.Hour)
+
+	if got := c.Stats().Hits; len(got) != 3 || got[0] != 0 || got[1] != 0 || got[2] != 0 {
+		t.Fatalf("initial Hits = %v, want [0 0 0]", got)
+	}
+
+	c.Set(1, 10)
+	c.genLock.Lock()
+	c.gc(c.head.Add(c.genDur))
+	c.genLock.Unlock()
+
+	if _, ok := c.Get(1); !ok {
+		t.Fatal("expected cache hit")
+	}
+	if got, want := c.Stats().Hits, []uint64{0, 0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("Hits = %v, want %v", got, want)
+	}
+}
+
+func TestCache_Stats_synced(t *testing.T) {
+	c := New[int, int](1, time.Hour)
+	done := &getOrSetDone[int]{done: make(chan struct{})}
+	close(done.done)
+	c.keySetChan[1] = done
+
+	if _, err := c.GetOrSetOnce(t.Context(), 1, func() (int, error) {
+		t.Fatal("loader should not be called")
+		return 0, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := c.Stats(); got.Misses != 1 || got.Synced != 1 || got.Sets != 0 || len(got.Hits) != 1 || got.Hits[0] != 0 {
+		t.Errorf("Stats() = %+v, want one synced miss", got)
+	}
+}
+
 func TestCache_expireAll(t *testing.T) {
 	c := New[int, int](3, time.Millisecond)
 
